@@ -1,0 +1,9 @@
+# .gitignore
+# Exclude everything by default
+*
+
+# But include these specific files
+!EX.py
+!EX1.py
+!.gitignore
+!README.md
