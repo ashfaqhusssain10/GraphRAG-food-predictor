@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 # Configuration constants
 NEO4J_URI = "neo4j://127.0.0.1:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "Ashfaq8790"
-GOOGLE_API_KEY = "AIzaSyBMk1QqgrS6ngivCNWeZf8TlARR58_BwQ4"
+NEO4J_PASSWORD = ""
+GOOGLE_API_KEY = "USE_YOUR_OWN"
 
 class GraphRAGState(TypedDict):
     """
