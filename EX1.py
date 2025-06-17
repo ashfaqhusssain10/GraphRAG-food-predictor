@@ -205,7 +205,7 @@ class SemanticRecommendationTool(BaseTool):
             query = f"Find dishes similar to {item_name} in flavor profile, texture, ingredients, and cooking style"
             
             # Use LangChain's retriever to find similar documents
-            similar_docs = self.retriever.invoke(query)
+            similar_docs = self.vector_store.similarity_search(query,top_k=10)
             
             recommendations = []
             seen_items=set()

@@ -44,7 +44,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration constants
-NEO4J_URI = "neo4j://127.0.0.1:7687"
+NEO4J_URI = "bolt://127.0.0.1:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = "Ashfaq8790"
 GOOGLE_API_KEY = "AIzaSyBMk1QqgrS6ngivCNWeZf8TlARR58_BwQ4"
@@ -103,9 +103,11 @@ class GraphRecommendationTool(BaseTool):
         """
         try:
             with self.neo4j_driver.session() as session:
-                result = session.run(""" MATCH (item:Item {name: $item_name})
-                    OPTIONAL MATCH (item)-[co:CO_OCCURS]-(other:Item)
-                    WHERE co.rate >= 0.15 AND co.rate <= 0.40
+                result = session.run("""
+                    MATCH (item:Item)-[co:CO_OCCURS]-(other:Item)
+                    WHERE (toLower(item.name) = toLower($item_name) OR item.name = $item_name)
+                
+                    AND co.rate >= 0.02 
                     WITH item, other, co
                     ORDER BY co.rate DESC
                     LIMIT $limit
@@ -205,64 +207,85 @@ class LangChainGraphRAGProcessor:
         
         logger.info("✓ Core components initialized")
     
+    #
     def load_neo4j_data_as_documents(self) -> List[Document]:
         """
         Convert your Neo4j graph data into LangChain Documents
-        This preserves your rich item descriptions while making them available to LangChain
+        FIXED: Proper variable definition and relationship data inclusion
         """
         logger.info("Loading Neo4j data and converting to LangChain Documents...")
         
         with self.driver.session() as session:
-            # Get all items with their rich attributes (same query as your current system)
             result = session.run("""
                 MATCH (i:Item)
+                OPTIONAL MATCH (i)-[co:CO_OCCURS]-(other:Item)
+                WITH i, 
+                    collect(other.name + ' (rate: ' + toString(round(co.rate, 3)) + ')') as pairings,
+                    collect(co.rate) as rates
                 RETURN i.name as name, 
-                       i.category as category,
-                       i.ingredients as ingredients,
-                       i.flavor_profile as flavor,
-                       i.texture as texture,
-                       i.spice_level as spice_level,
-                       i.occasion as occasion,
-                       i.complementary_items as complementary,
-                       i.cuisine_type as cuisine_type
+                    i.category as category,
+                    i.ingredients as ingredients,
+                    i.flavor_profile as flavor,
+                    i.texture as texture,
+                    i.spice_level as spice_level,
+                    i.occasion as occasion,
+                    i.complementary_items as complementary,
+                    i.cuisine_type as cuisine_type,
+                    pairings,
+                    rates,
+                    size(pairings) as pairing_count
             """)
             
             documents = []
             for record in result:
-                # Create the same rich text representation you had before
-                page_content = f"""
-                {record['name']} is a {record['category']} dish from {record['cuisine_type']} cuisine.
-                Ingredients: {record['ingredients']}
-                Flavor Profile: {record['flavor']}
-                Texture: {record['texture']}
-                Spice Level: {record['spice_level']}/10
-                Best for: {record['occasion']}
-                Goes well with: {', '.join(record['complementary'] or [])}
-                """.strip()
+                # FIXED: Define page_content_parts as a list from the start
+                pairings = record['pairings'] or []
+                pairing_count = record['pairing_count'] or 0
                 
-                # LangChain metadata - more flexible than LlamaIndex
+                page_content_parts = [  # ✅ FIXED: Define as list
+                    f"{record['name']} is a {record['category']} dish from {record['cuisine_type']} cuisine.",
+                    f"Ingredients: {record['ingredients']}",
+                    f"Flavor Profile: {record['flavor']}",
+                    f"Texture: {record['texture']}",
+                    f"Spice Level: {record['spice_level']}/10",
+                    f"Best for: {record['occasion']}",
+                    f"Goes well with: {', '.join(record['complementary'] or [])}"
+                ]
+                
+                # Add pairing information - THIS WAS MISSING!
+                if pairings and pairing_count > 0:
+                    top_pairings = pairings[:8]  # Top 8 pairings
+                    page_content_parts.append(f"Data-driven pairings: {', '.join(top_pairings)}")
+                    page_content_parts.append(f"Successfully pairs with {pairing_count} different items")
+                else:
+                    page_content_parts.append(f"{record['name']} is typically ordered individually")
+                
+                page_content = "\n".join(page_content_parts)  # ✅ FIXED: Now works correctly
+                
                 metadata = {
                     "item_name": record['name'],
                     "category": record['category'],
                     "spice_level": record['spice_level'],
                     "cuisine_type": record['cuisine_type'],
                     "source": "neo4j_graph",
-                    # Additional metadata for potential filtering
                     "has_ingredients": bool(record['ingredients']),
-                    "has_flavor_profile": bool(record['flavor'])
+                    "has_flavor_profile": bool(record['flavor']),
+                    "pairing_count": pairing_count,  # NEW: For filtering
+                    "top_pairings_str": ", ".join(pairings[:3]) if pairings else "none",
+                    "has_pairings": bool(pairings),
+                    "popularity_level": "high" if pairing_count > 10 else ("medium" if pairing_count > 3 else "low")
                 }
                 
-                # Create LangChain Document - using updated import
                 doc = Document(page_content=page_content, metadata=metadata)
                 documents.append(doc)
             
-            logger.info(f"✓ Created {len(documents)} LangChain Documents from Neo4j data")
+            logger.info(f"✓ Created {len(documents)} LangChain Documents with relationship data")
             return documents
     
     def create_vector_index(self, documents: List[Document]):
         """
         Create vector embeddings and storage using ChromaDB
-        Updated to use compatible import paths
+        Multi-strategy approach for ChromaDB 0.5.23 compatibility
         """
         logger.info("Creating vector embeddings and ChromaDB index...")
         
@@ -270,20 +293,47 @@ class LangChainGraphRAGProcessor:
         split_docs = self.text_splitter.split_documents(documents)
         logger.info(f"Split into {len(split_docs)} chunks")
         
-        # Create ChromaDB vector store with persistence - updated import ensures compatibility
-        self.vector_store = Chroma.from_documents(
-            documents=split_docs,
-            embedding=self.embeddings,
-            persist_directory="./chromadb_storage",  # Persistent storage
-            collection_name="menu_items"
-        )
+        # Strategy 1: Try the environment variable approach first
+        # This is ChromaDB's recommended way to control telemetry in 0.5.x versions
+        try:
+            import os
+            os.environ["ANONYMIZED_TELEMETRY"] = "false"  # Note: lowercase "false" for ChromaDB 0.5.x
+            
+            self.vector_store = Chroma.from_documents(
+                documents=split_docs,
+                embedding=self.embeddings,
+                persist_directory="./chromadb_storage",
+                collection_name="menu_items"
+            )
+            
+            logger.info("✓ Vector store created using environment variable approach")
+            
+        except Exception as e:
+            logger.warning(f"Environment variable approach failed: {e}")
+            logger.info("Trying fallback approach...")
+            
+            # Strategy 2: Fallback to basic configuration without client_settings
+            # This removes the problematic parameter entirely
+            try:
+                self.vector_store = Chroma.from_documents(
+                    documents=split_docs,
+                    embedding=self.embeddings,
+                    persist_directory="./chromadb_storage",
+                    collection_name="menu_items"
+                )
+                
+                logger.info("✓ Vector store created using basic configuration")
+                
+            except Exception as e:
+                logger.error(f"All ChromaDB configuration approaches failed: {e}")
+                raise RuntimeError(f"Unable to initialize ChromaDB with version 0.5.23: {e}")
         
         # Create retriever with optimized settings for your use case
+        # This part works the same regardless of which strategy succeeded
         self.retriever = self.vector_store.as_retriever(
             search_type="similarity",
             search_kwargs={
                 "k": 10,  # Get more candidates for better filtering
-                #"score_threshold": 0.7  # Ensure minimum relevance
             }
         )
         
@@ -393,6 +443,7 @@ class LangChainGraphRAGProcessor:
                 graph_result = self.graph_tool._run(item_name, top_k=5)
                 state["graph_recommendations"] = self._parse_graph_results(graph_result)
                 state["messages"].append(f"Graph recommendations: {len(state['graph_recommendations'])} found")
+                logger.info(f"Graph tool returned: {graph_result[:200]}...")
             except Exception as e:
                 logger.error(f"Graph tool error: {e}")
                 state["graph_recommendations"] = []
@@ -403,6 +454,7 @@ class LangChainGraphRAGProcessor:
                 semantic_result = self.semantic_tool._run(item_name, top_k=5)
                 state["semantic_recommendations"] = self._parse_semantic_results(semantic_result)
                 state["messages"].append(f"Semantic recommendations: {len(state['semantic_recommendations'])} found")
+                logger.info(f"Semantic tool returned: {semantic_result[:200]}...")
             except Exception as e:
                 logger.error(f"Semantic tool error: {e}")
                 state["semantic_recommendations"] = []
@@ -431,16 +483,22 @@ class LangChainGraphRAGProcessor:
 Current item: {item_name}
 
 ANALYSIS RESULTS FROM OUR SYSTEMS:
-NOVEL PAIRINGS (from customer ordering patterns):
+GRAPH-BASED PAIRINGS (from customer ordering patterns):
 {graph_context}
-SIMILAR ITEMS (based on flavor/texture analysis):
+
+SEMANTIC SIMILARITIES (based on flavor/texture analysis):
 {semantic_context}
 
-CRITICAL INSTRUCTION: You MUST base your recommendations on the items listed above. Do NOT invent new items.
+INSTRUCTIONS:
+1. Use ONLY the items listed above from our data analysis
+2. Choose 2-3 specific items from the analysis results
+3. Explain WHY each pairing works well with {item_name}
+4. Include confidence levels when available
 
-Task: Choose 2-3 items from the data above and explain why they pair well with {item_name}.
 
-Start each recommendation with: "Based on our analysis, [ITEM NAME] pairs surprisingly well with {item_name}..."
+Start with: "Based on our analysis, here are proven pairings for {item_name}:"
+
+IMPORTANT: If no recommendations are found, respond with "Based on our current data, we need more information to provide specific pairing recommendations for {item_name}."
 """
 
             )
@@ -706,7 +764,165 @@ class EnhancedKnowledgeGraphBuilder:
             composition['categories'] = list(composition['categories'])  # Convert set to list
         
         self.logger.info(f"✓ Analyzed {len(self.menu_compositions)} menu compositions")
-    
+    def diagnose_pipeline_consistency(self, session):
+        """
+        Diagnostic function to understand why Item names from the same source don't match
+        This teaches us about pipeline consistency and data processing best practices
+        """
+        self.logger.info("="*60)
+        self.logger.info("PIPELINE CONSISTENCY DIAGNOSTIC")
+        self.logger.info("="*60)
+        
+        # Step 1: Get all Item names currently in Neo4j
+        neo4j_items_query = "MATCH (i:Item) RETURN i.name as name ORDER BY i.name"
+        neo4j_result = session.run(neo4j_items_query)
+        neo4j_item_names = set([record['name'] for record in neo4j_result])
+        
+        self.logger.info(f"Neo4j contains {len(neo4j_item_names)} unique Item nodes")
+        
+        # Step 2: Analyze DF1.xlsx exactly as we're processing it for menu compositions
+        df1_item_names_from_menus = set()
+        for menu_id, composition in self.menu_compositions.items():
+            for item_name in composition['items']:
+                if pd.notna(item_name):  # This is key - check how we handle NaN values
+                    df1_item_names_from_menus.add(item_name)
+        
+        self.logger.info(f"DF1 menu processing found {len(df1_item_names_from_menus)} unique item names")
+        
+        # Step 3: Direct analysis of DF1.xlsx to understand the raw data
+        raw_df1_items = set()
+        for _, row in self.df1_data.iterrows():
+            item_name = row['item_name']
+            if pd.notna(item_name):
+                raw_df1_items.add(item_name)
+        
+        self.logger.info(f"Raw DF1.xlsx contains {len(raw_df1_items)} unique item names")
+        
+        # Step 4: Compare the different sets to understand the discrepancies
+        neo4j_vs_menu_exact = neo4j_item_names & df1_item_names_from_menus
+        only_in_neo4j = neo4j_item_names - df1_item_names_from_menus
+        only_in_menus = df1_item_names_from_menus - neo4j_item_names
+        
+        self.logger.info(f"Exact matches between Neo4j and menu processing: {len(neo4j_vs_menu_exact)}")
+        self.logger.info(f"Items in Neo4j but not in menu processing: {len(only_in_neo4j)}")
+        self.logger.info(f"Items in menu processing but not in Neo4j: {len(only_in_menus)}")
+        
+        # Step 5: Show samples to reveal the pattern
+        if only_in_neo4j:
+            self.logger.info("Sample items in Neo4j but missing from menu processing:")
+            for item in sorted(list(only_in_neo4j))[:10]:
+                self.logger.info(f"  Neo4j has: '{item}'")
+        
+        if only_in_menus:
+            self.logger.info("Sample items in menu processing but missing from Neo4j:")
+            for item in sorted(list(only_in_menus))[:10]:
+                self.logger.info(f"  Menu processing has: '{item}'")
+        
+        # Step 6: Check for subtle differences like whitespace or capitalization
+        if only_in_menus and only_in_neo4j:
+            self.logger.info("Checking for near-matches (whitespace/capitalization issues):")
+            for menu_item in list(only_in_menus)[:5]:
+                menu_item_normalized = menu_item.strip().lower()
+                for neo4j_item in only_in_neo4j:
+                    neo4j_item_normalized = neo4j_item.strip().lower()
+                    if menu_item_normalized == neo4j_item_normalized:
+                        self.logger.info(f"  Near match found:")
+                        self.logger.info(f"    Menu: '{menu_item}'")
+                        self.logger.info(f"    Neo4j: '{neo4j_item}'")
+                        break
+        
+        return {
+            'neo4j_items': neo4j_item_names,
+            'menu_items': df1_item_names_from_menus,
+            'raw_df1_items': raw_df1_items,
+            'exact_matches': neo4j_vs_menu_exact,
+            'diagnosis_complete': True
+        }
+    def investigate_complete_relationship_pipeline(self, session):
+        """
+        Comprehensive investigation of all CONTAINS relationship creation in the system
+        This teaches us about understanding complex system behavior and state management
+        """
+        self.logger.info("="*70)
+        self.logger.info("COMPLETE RELATIONSHIP PIPELINE INVESTIGATION")
+        self.logger.info("="*70)
+        
+        # Step 1: Check initial database state
+        initial_contains_query = "MATCH ()-[r:CONTAINS]->() RETURN count(r) as count"
+        initial_result = session.run(initial_contains_query)
+        initial_contains_count = initial_result.single()['count']
+        
+        self.logger.info(f"Initial CONTAINS relationships in database: {initial_contains_count}")
+        
+        # Step 2: Analyze the structure of existing CONTAINS relationships
+        if initial_contains_count > 0:
+            sample_contains_query = """
+            MATCH (source)-[r:CONTAINS]->(target) 
+            RETURN labels(source) as source_labels, 
+                labels(target) as target_labels, 
+                keys(r) as relationship_properties,
+                count(*) as count
+            LIMIT 10
+            """
+            sample_result = session.run(sample_contains_query)
+            
+            self.logger.info("Sample of existing CONTAINS relationships:")
+            for record in sample_result:
+                source_type = record['source_labels'][0] if record['source_labels'] else 'Unknown'
+                target_type = record['target_labels'][0] if record['target_labels'] else 'Unknown'
+                props = record['relationship_properties']
+                count = record['count']
+                self.logger.info(f"  {source_type} -[CONTAINS {props}]-> {target_type} (count: {count})")
+        
+        # Step 3: Check if CONTAINS relationships use Menu -> Item pattern
+        menu_item_contains_query = "MATCH (m:Menu)-[r:CONTAINS]->(i:Item) RETURN count(r) as count"
+        menu_item_result = session.run(menu_item_contains_query)
+        menu_item_contains_count = menu_item_result.single()['count']
+        
+        self.logger.info(f"Menu -> Item CONTAINS relationships: {menu_item_contains_count}")
+        
+        # Step 4: Check for other patterns of CONTAINS relationships
+        other_contains_query = """
+        MATCH (source)-[r:CONTAINS]->(target) 
+        WHERE NOT (source:Menu AND target:Item)
+        RETURN labels(source)[0] as source_type, labels(target)[0] as target_type, count(r) as count
+        """
+        other_result = session.run(other_contains_query)
+        
+        self.logger.info("Other CONTAINS relationship patterns:")
+        for record in other_result:
+            source_type = record['source_type']
+            target_type = record['target_type']
+            count = record['count']
+            self.logger.info(f"  {source_type} -> {target_type}: {count} relationships")
+        
+        # Step 5: Investigate Menu node structure
+        menu_count_query = "MATCH (m:Menu) RETURN count(m) as count"
+        menu_count_result = session.run(menu_count_query)
+        menu_count = menu_count_result.single()['count']
+        
+        self.logger.info(f"Total Menu nodes in database: {menu_count}")
+        
+        # Step 6: Check for Menu nodes that already have CONTAINS relationships
+        menus_with_contains_query = """
+        MATCH (m:Menu)-[r:CONTAINS]->() 
+        RETURN count(DISTINCT m) as menus_with_relationships, count(r) as total_relationships
+        """
+        menus_with_result = session.run(menus_with_contains_query)
+        result_record = menus_with_result.single()
+        menus_with_relationships = result_record['menus_with_relationships']
+        total_from_menus = result_record['total_relationships']
+        
+        self.logger.info(f"Menu nodes with CONTAINS relationships: {menus_with_relationships}")
+        self.logger.info(f"Total CONTAINS relationships from Menu nodes: {total_from_menus}")
+        
+        return {
+            'initial_contains_count': initial_contains_count,
+            'menu_item_contains_count': menu_item_contains_count,
+            'menu_count': menu_count,
+            'menus_with_relationships': menus_with_relationships,
+            'investigation_complete': True
+        }
     def create_enhanced_knowledge_graph(self):
         """
         Build the complete multi-dimensional knowledge graph
@@ -724,6 +940,10 @@ class EnhancedKnowledgeGraphBuilder:
             raise ValueError("Must load DF1 data before building knowledge graph")
         
         with self.driver.session() as session:
+            investigation_results = self.investigate_complete_relationship_pipeline(session)
+            # ADD THIS DIAGNOSTIC CALL RIGHT HERE
+            self.logger.info("Running pipeline consistency diagnostic...")
+            diagnostic_results = self.diagnose_pipeline_consistency(session)
             # Step 1: Create Menu nodes from real business data
             self._create_menu_nodes(session)
             

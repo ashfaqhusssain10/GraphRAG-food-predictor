@@ -4,6 +4,18 @@
 
 # But include these specific files
 !EX.py
+!EX2.py
 !EX1.py
+!132.py
+!456.py
+!789.py
+!Biryani_debug.py
+!Data.py
+!debug.py
+!debug2.py
+!mock.py
+!mock2.py
+!textparser.py
+!debud_grapghrag.py
 !.gitignore
-!README.md
+!README.mdgit 
